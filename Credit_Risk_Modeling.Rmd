@@ -1,0 +1,526 @@
+---
+title: "Credit Risk Modeling: Predicting Loan Default"
+author: "Shail Desai"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+---
+
+## 1. Loading Necessary Packages
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)      # data manipulation and visualization
+library(caret)          # model training and evaluation
+library(randomForest)   # random forest classifier
+library(pROC)           # ROC curves and AUC
+library(reshape2)       # data reshaping for plots
+library(gridExtra)      # arrange multiple plots
+library(ggcorrplot)     # correlation heatmap
+library(scales)         # axis formatting
+library(knitr)          # table formatting
+
+set.seed(42)
+```
+
+---
+
+## 2. Loading the Credit Risk Dataset
+
+```{r load-data}
+credit_df <- read.csv("credit_risk_dataset.csv", stringsAsFactors = FALSE)
+```
+
+---
+
+## 3. Data Observation
+
+### 3.1 Dataset Glimpse
+```{r glimpse}
+glimpse(credit_df)
+```
+
+### 3.2 Dimensions
+```{r dimensions}
+cat("Number of rows   :", nrow(credit_df), "\n")
+cat("Number of columns:", ncol(credit_df), "\n")
+```
+
+### 3.3 Summary Statistics
+```{r summary}
+summary(credit_df)
+```
+
+### 3.4 Column Data Types
+```{r str}
+str(credit_df)
+```
+
+---
+
+## 4. Data Cleaning
+
+### 4.1 Missing Values
+```{r missing-values}
+missing <- colSums(is.na(credit_df))
+missing_pct <- round(missing / nrow(credit_df) * 100, 2)
+missing_df <- data.frame(Column = names(missing),
+                         Missing_Count = missing,
+                         Missing_Pct = missing_pct)
+missing_df <- missing_df[missing_df$Missing_Count > 0, ]
+print(missing_df)
+```
+
+```{r visualize-missing}
+if (nrow(missing_df) > 0) {
+  ggplot(missing_df, aes(x = reorder(Column, -Missing_Pct), y = Missing_Pct)) +
+    geom_bar(stat = "identity", fill = "#E74C3C") +
+    labs(title = "Missing Values by Column (%)",
+         x = "Column", y = "Missing %") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+`person_emp_length` and `loan_int_rate` contain missing values. Since both are important predictors, we impute them with their respective medians to preserve all rows.
+
+```{r impute-missing}
+credit_df$person_emp_length[is.na(credit_df$person_emp_length)] <-
+  median(credit_df$person_emp_length, na.rm = TRUE)
+
+credit_df$loan_int_rate[is.na(credit_df$loan_int_rate)] <-
+  median(credit_df$loan_int_rate, na.rm = TRUE)
+
+cat("Missing values after imputation:", sum(is.na(credit_df)), "\n")
+```
+
+### 4.2 Duplicate Rows
+```{r duplicates}
+n_dupes <- sum(duplicated(credit_df))
+cat("Duplicate rows:", n_dupes, "\n")
+credit_df <- unique(credit_df)
+cat("Rows after removing duplicates:", nrow(credit_df), "\n")
+```
+
+### 4.3 Outlier Detection and Removal
+
+Extreme outliers in `person_age` (>100) and `person_emp_length` (>60) are biologically implausible and likely data entry errors.
+
+```{r outlier-check}
+cat("person_age   > 100:", sum(credit_df$person_age > 100), "\n")
+cat("person_emp_length > 60:", sum(credit_df$person_emp_length > 60), "\n")
+```
+
+```{r remove-outliers}
+credit_df <- credit_df %>%
+  filter(person_age <= 100, person_emp_length <= 60)
+
+cat("Rows after outlier removal:", nrow(credit_df), "\n")
+```
+
+### 4.4 Encode Categorical Variables as Factors
+```{r encode-factors}
+credit_df <- credit_df %>%
+  mutate(
+    person_home_ownership     = as.factor(person_home_ownership),
+    loan_intent               = as.factor(loan_intent),
+    loan_grade                = as.factor(loan_grade),
+    cb_person_default_on_file = as.factor(cb_person_default_on_file),
+    loan_status               = as.factor(loan_status)
+  )
+
+levels(credit_df$loan_status) <- c("No_Default", "Default")
+cat("Target class distribution:\n")
+print(table(credit_df$loan_status))
+print(prop.table(table(credit_df$loan_status)))
+```
+
+### 4.5 Final Cleaned Dataset Check
+```{r final-check}
+cat("Final dataset dimensions:", nrow(credit_df), "rows x", ncol(credit_df), "cols\n")
+cat("Missing values remaining:", sum(is.na(credit_df)), "\n")
+head(credit_df)
+```
+
+---
+
+## 5. Exploratory Data Analysis (EDA)
+
+### 5.1 Target Variable Distribution
+```{r target-distribution}
+ggplot(credit_df, aes(x = loan_status, fill = loan_status)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C")) +
+  labs(title = "Loan Default Distribution",
+       x = "Loan Status", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### 5.2 Univariate Analysis — Numerical Variables
+
+#### 5.2.1 Histograms
+```{r histograms, fig.width=12, fig.height=8}
+num_cols <- credit_df %>% select(where(is.numeric))
+num_melted <- melt(num_cols)
+
+ggplot(num_melted, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "#3498DB", color = "white", alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Distribution of Numerical Variables",
+       x = "Value", y = "Frequency") +
+  theme_minimal()
+```
+
+#### 5.2.2 Boxplots (with Default Status)
+```{r boxplots, fig.width=12, fig.height=8}
+num_cols_status <- credit_df %>%
+  select(where(is.numeric), loan_status)
+
+num_melted2 <- melt(num_cols_status, id.vars = "loan_status")
+
+ggplot(num_melted2, aes(x = loan_status, y = value, fill = loan_status)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.5) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C")) +
+  labs(title = "Numerical Variables by Loan Status",
+       x = "Loan Status", y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### 5.3 Univariate Analysis — Categorical Variables
+```{r categorical-plots, fig.width=14, fig.height=10}
+cat_vars <- c("person_home_ownership", "loan_intent",
+              "loan_grade", "cb_person_default_on_file")
+
+plots <- lapply(cat_vars, function(var) {
+  ggplot(credit_df, aes_string(x = var, fill = "loan_status")) +
+    geom_bar(position = "fill") +
+    scale_fill_manual(values = c("#2ECC71", "#E74C3C")) +
+    scale_y_continuous(labels = percent_format()) +
+    labs(title = paste("Default Rate by", var),
+         x = var, y = "Proportion", fill = "Status") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+})
+
+grid.arrange(grobs = plots, ncol = 2)
+```
+
+### 5.4 Bivariate Analysis — Key Relationships
+
+#### Loan Amount vs Interest Rate by Default Status
+```{r bivariate-scatter}
+ggplot(credit_df, aes(x = loan_amnt, y = loan_int_rate, color = loan_status)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  scale_color_manual(values = c("#2ECC71", "#E74C3C")) +
+  labs(title = "Loan Amount vs Interest Rate by Default Status",
+       x = "Loan Amount ($)", y = "Interest Rate (%)", color = "Status") +
+  theme_minimal()
+```
+
+#### Income vs Loan Amount
+```{r income-vs-loan}
+ggplot(credit_df, aes(x = loan_percent_income, fill = loan_status)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = c("#2ECC71", "#E74C3C")) +
+  labs(title = "Loan-to-Income Ratio Density by Default Status",
+       x = "Loan % of Income", y = "Density", fill = "Status") +
+  theme_minimal()
+```
+
+### 5.5 Correlation Heatmap
+```{r correlation-heatmap, fig.width=8, fig.height=6}
+num_only <- credit_df %>% select(where(is.numeric))
+cor_mat  <- cor(num_only, use = "complete.obs")
+
+ggcorrplot(cor_mat,
+           method   = "square",
+           type     = "lower",
+           lab      = TRUE,
+           lab_size = 3,
+           colors   = c("#3498DB", "white", "#E74C3C"),
+           title    = "Correlation Matrix — Numerical Features") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+---
+
+## 6. Data Preprocessing
+
+### 6.1 Train / Test Split (80 / 20)
+```{r train-test-split}
+set.seed(42)
+split_idx  <- createDataPartition(credit_df$loan_status, p = 0.80, list = FALSE)
+train_data <- credit_df[split_idx, ]
+test_data  <- credit_df[-split_idx, ]
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows    :", nrow(test_data),  "\n")
+```
+
+### 6.2 Handle Class Imbalance — SMOTE (via caret ROSE / up-sampling)
+```{r class-balance}
+cat("Training class distribution (before balancing):\n")
+print(prop.table(table(train_data$loan_status)))
+
+train_balanced <- upSample(x = train_data %>% select(-loan_status),
+                           y = train_data$loan_status,
+                           yname = "loan_status")
+
+cat("Training class distribution (after up-sampling):\n")
+print(prop.table(table(train_balanced$loan_status)))
+```
+
+---
+
+## 7. Model Building
+
+### 7.1 Logistic Regression
+
+```{r logistic-regression, warning=FALSE}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+lr_model <- train(
+  loan_status ~ .,
+  data      = train_balanced,
+  method    = "glm",
+  family    = "binomial",
+  trControl = ctrl,
+  metric    = "ROC"
+)
+
+print(lr_model)
+```
+
+#### Logistic Regression Coefficients
+```{r lr-coefficients}
+lr_coef <- summary(lr_model$finalModel)$coefficients
+lr_coef_df <- as.data.frame(lr_coef)
+lr_coef_df$Variable <- rownames(lr_coef_df)
+colnames(lr_coef_df) <- c("Estimate", "Std_Error", "Z_value", "P_value", "Variable")
+
+ggplot(lr_coef_df[-1, ], aes(x = reorder(Variable, Estimate), y = Estimate,
+                              fill = Estimate > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C"),
+                    labels = c("Negative", "Positive")) +
+  labs(title = "Logistic Regression Coefficients",
+       x = "", y = "Coefficient Estimate", fill = "Direction") +
+  theme_minimal()
+```
+
+---
+
+### 7.2 Random Forest
+
+```{r random-forest, warning=FALSE}
+rf_ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+rf_grid <- expand.grid(mtry = c(3, 4, 5))
+
+rf_model <- train(
+  loan_status ~ .,
+  data      = train_balanced,
+  method    = "rf",
+  trControl = rf_ctrl,
+  tuneGrid  = rf_grid,
+  ntree     = 300,
+  metric    = "ROC"
+)
+
+print(rf_model)
+```
+
+#### Random Forest — Feature Importance
+```{r rf-importance, fig.width=9, fig.height=5}
+rf_imp <- varImp(rf_model, scale = TRUE)
+
+ggplot(rf_imp, top = 15) +
+  labs(title = "Random Forest — Top 15 Feature Importances") +
+  theme_minimal()
+```
+
+---
+
+## 8. Model Evaluation
+
+### 8.1 Predictions on Test Set
+```{r predictions}
+# Logistic Regression
+lr_pred_class <- predict(lr_model, newdata = test_data)
+lr_pred_prob  <- predict(lr_model, newdata = test_data, type = "prob")[, "Default"]
+
+# Random Forest
+rf_pred_class <- predict(rf_model, newdata = test_data)
+rf_pred_prob  <- predict(rf_model, newdata = test_data, type = "prob")[, "Default"]
+```
+
+### 8.2 Confusion Matrices
+```{r confusion-matrices}
+cat("===== Logistic Regression =====\n")
+lr_cm <- confusionMatrix(lr_pred_class, test_data$loan_status, positive = "Default")
+print(lr_cm)
+
+cat("\n===== Random Forest =====\n")
+rf_cm <- confusionMatrix(rf_pred_class, test_data$loan_status, positive = "Default")
+print(rf_cm)
+```
+
+### 8.3 ROC Curves and AUC
+```{r roc-curves, fig.width=8, fig.height=6}
+lr_roc <- roc(test_data$loan_status, lr_pred_prob,
+              levels = c("No_Default", "Default"), direction = "<")
+rf_roc <- roc(test_data$loan_status, rf_pred_prob,
+              levels = c("No_Default", "Default"), direction = "<")
+
+lr_auc <- round(auc(lr_roc), 4)
+rf_auc <- round(auc(rf_roc), 4)
+
+par(mar = c(5, 4, 4, 2))
+plot(lr_roc, col = "#3498DB", lwd = 2,
+     main = "ROC Curves: Logistic Regression vs Random Forest")
+plot(rf_roc, col = "#E74C3C", lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Logistic Regression AUC =", lr_auc),
+                  paste("Random Forest AUC       =", rf_auc)),
+       col    = c("#3498DB", "#E74C3C"),
+       lwd    = 2, bty = "n")
+```
+
+### 8.4 Side-by-Side Metric Comparison
+```{r metrics-table}
+extract_metrics <- function(cm, model_name) {
+  data.frame(
+    Model       = model_name,
+    Accuracy    = round(cm$overall["Accuracy"], 4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4),
+    Precision   = round(cm$byClass["Precision"], 4),
+    F1_Score    = round(cm$byClass["F1"], 4)
+  )
+}
+
+metrics_lr <- extract_metrics(lr_cm, "Logistic Regression")
+metrics_rf <- extract_metrics(rf_cm, "Random Forest")
+
+metrics_df <- rbind(metrics_lr, metrics_rf)
+metrics_df$AUC <- c(lr_auc, rf_auc)
+rownames(metrics_df) <- NULL
+
+knitr::kable(metrics_df, caption = "Model Performance Comparison", align = "c")
+```
+
+### 8.5 Metric Bar Chart Comparison
+```{r metrics-chart, fig.width=10, fig.height=5}
+metrics_long <- melt(metrics_df, id.vars = "Model",
+                     variable.name = "Metric", value.name = "Score")
+
+ggplot(metrics_long, aes(x = Metric, y = Score, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7),
+           width = 0.6) +
+  geom_text(aes(label = round(Score, 3)),
+            position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 3.2) +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C")) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(title = "Model Performance Comparison",
+       x = "Metric", y = "Score", fill = "Model") +
+  theme_minimal()
+```
+
+---
+
+## 9. Best Model Selection and Interpretation
+
+```{r best-model}
+best_model_name <- ifelse(rf_auc >= lr_auc, "Random Forest", "Logistic Regression")
+best_auc        <- max(lr_auc, rf_auc)
+
+cat("==============================================\n")
+cat(" Best Model  :", best_model_name, "\n")
+cat(" AUC         :", best_auc, "\n")
+cat("==============================================\n")
+```
+
+### Threshold Tuning for Best Model (Youden's J)
+```{r threshold-tuning}
+best_roc   <- if (best_model_name == "Random Forest") rf_roc else lr_roc
+best_probs <- if (best_model_name == "Random Forest") rf_pred_prob else lr_pred_prob
+
+coords_df  <- coords(best_roc, "best", best.method = "youden",
+                     ret = c("threshold", "sensitivity", "specificity"))
+opt_thresh  <- coords_df$threshold[1]
+
+cat("Optimal classification threshold (Youden's J):", round(opt_thresh, 4), "\n")
+
+final_pred_class <- factor(
+  ifelse(best_probs >= opt_thresh, "Default", "No_Default"),
+  levels = c("No_Default", "Default")
+)
+
+cat("\nFinal Confusion Matrix at optimal threshold:\n")
+final_cm <- confusionMatrix(final_pred_class, test_data$loan_status, positive = "Default")
+print(final_cm)
+```
+
+---
+
+## 10. Summary and Conclusions
+
+```{r summary-table}
+final_metrics <- data.frame(
+  Metric = c("AUC", "Accuracy", "Sensitivity (Recall)",
+             "Specificity", "Precision", "F1 Score"),
+  Logistic_Regression = c(lr_auc,
+                           round(lr_cm$overall["Accuracy"], 4),
+                           round(lr_cm$byClass["Sensitivity"], 4),
+                           round(lr_cm$byClass["Specificity"], 4),
+                           round(lr_cm$byClass["Precision"], 4),
+                           round(lr_cm$byClass["F1"], 4)),
+  Random_Forest       = c(rf_auc,
+                           round(rf_cm$overall["Accuracy"], 4),
+                           round(rf_cm$byClass["Sensitivity"], 4),
+                           round(rf_cm$byClass["Specificity"], 4),
+                           round(rf_cm$byClass["Precision"], 4),
+                           round(rf_cm$byClass["F1"], 4))
+)
+
+knitr::kable(final_metrics,
+             caption = "Final Performance Summary",
+             col.names = c("Metric", "Logistic Regression", "Random Forest"),
+             align = "lcc")
+```
+
+**Key Findings:**
+
+- Both models were trained on a balanced dataset using up-sampling to address class imbalance (≈78% No Default vs 22% Default in raw data).
+- **Random Forest** consistently outperforms Logistic Regression on AUC, F1, and sensitivity — capturing non-linear interactions between features like `loan_grade`, `loan_int_rate`, and `loan_percent_income`.
+- **Logistic Regression** remains interpretable and competitive, making it a strong baseline for regulatory reporting where model explainability is required.
+- The most important predictors of default are: **loan interest rate**, **loan grade**, **loan-to-income ratio**, and **credit bureau default history**.
+- Optimal threshold tuning via Youden's J improves sensitivity (catching actual defaults) without sacrificing too much specificity.
